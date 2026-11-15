@@ -294,6 +294,7 @@ def conversation_revision_columns(owner=ConversationV3.id):
         .where(
             ConversationEvent.conversation_ref == owner,
             text("type IN ('message.appended', 'context.rebased')"),
+            func.json_extract(ConversationEvent.payload, "$.delivery").is_(None),
         )
         .order_by(ConversationEvent.seq.desc())
         .limit(1)
@@ -358,6 +359,7 @@ class ConversationStore:
                     not owner
                     or not same_conversation_owner(owner.umo, umo)
                     or source.type not in CONTEXT_TYPES
+                    or "delivery" in (source.payload or {})
                 ):
                     raise ValueError("The source must be an accessible context event")
                 if content is not None:
@@ -475,6 +477,7 @@ class ConversationStore:
                     ConversationEvent.conversation_ref,
                     ConversationEvent.type,
                     ConversationEvent.seq,
+                    ConversationEvent.payload,
                     baseline_event,
                 )
                 .select_from(ConversationV3)
@@ -497,7 +500,11 @@ class ConversationStore:
         )
         if position.event_id is None and (leaf is NOT_GIVEN or leaf is None):
             return snapshot
-        if position.conversation_ref != conv.id or position.type not in CONTEXT_TYPES:
+        if (
+            position.conversation_ref != conv.id
+            or position.type not in CONTEXT_TYPES
+            or "delivery" in (position.payload or {})
+        ):
             raise ValueError("Missing or inaccessible context leaf")
         target, baseline = position, position[-1]
         snapshot.context_seq = target.seq
@@ -531,7 +538,11 @@ class ConversationStore:
             effective = persistent_messages([event.payload["message"]])
             # Older journals contain a separate raw copy marked as excluded.
             # Keep ignoring it so upgrading cannot replay both stored copies.
-            if event.payload.get("include_in_context", True) and effective:
+            if (
+                "delivery" not in event.payload
+                and event.payload.get("include_in_context", True)
+                and effective
+            ):
                 snapshot.entries.append({"id": event.event_id, "message": effective[0]})
             snapshot.replay_count += 1
         return snapshot
@@ -583,6 +594,9 @@ class ConversationStore:
                             ConversationEvent.conversation_ref,
                             ConversationEvent.type,
                             ConversationEvent.version,
+                            func.json_type(
+                                ConversationEvent.payload, "$.delivery"
+                            ).label("delivery"),
                             baseline.version.label("baseline_version"),
                             baseline.payload.is_(None).label("pruned"),
                         )
@@ -604,7 +618,11 @@ class ConversationStore:
                 for row in rows:
                     if row.conversation_ref != conv.id:
                         result[row.event_id] = "forbidden"
-                    elif row.type not in CONTEXT_TYPES or row.version != 1:
+                    elif (
+                        row.type not in CONTEXT_TYPES
+                        or row.version != 1
+                        or row.delivery
+                    ):
                         result[row.event_id] = "missing"
                     elif row.baseline_version is None:
                         result[row.event_id] = "available"
@@ -862,6 +880,10 @@ class ConversationStore:
                 raise ValueError("A message requires a role")
             if message["role"] not in ("system", "user", "assistant", "tool"):
                 raise ValueError("Unsupported message role")
+            if "delivery" in payload and (
+                message["role"] != "user" or not isinstance(payload["delivery"], dict)
+            ):
+                raise ValueError("Only received user messages can await delivery")
             if "include_in_context" in payload:
                 raise ValueError("Use message._no_save instead of include_in_context")
         elif kind == "context.rebased":
@@ -1212,7 +1234,7 @@ class ConversationStore:
                 batch_bytes += size
                 batch_events[event.event_id] = event
                 committed.append(event)
-                if kind in CONTEXT_TYPES:
+                if kind in CONTEXT_TYPES and "delivery" not in payload:
                     leaf_event_id = event.event_id
                 if kind == "context.rebased" and payload.get("origin") == "plugin":
                     has_plugin_baseline = True
@@ -1236,6 +1258,44 @@ class ConversationStore:
                 await self._prune_plugin_context(session, conv)
             await session.commit()
             return ConversationAppendResult(committed)
+
+    async def pending_messages(self, cid: str) -> list[ConversationEvent]:
+        """Read accepted user messages without a committed consumption checkpoint.
+
+        Args:
+            cid: Exact owning conversation identity.
+
+        Returns:
+            Pending message events in receipt order. Their existing event IDs
+            also identify consumption; no separate input identities are created.
+        """
+        async with self.db.get_db() as session:
+            rows = await session.execute(
+                text("""SELECT pending.* FROM conversation_events AS pending
+                    JOIN conversations_v3 AS conversation
+                      ON conversation.id = pending.conversation_ref
+                    WHERE conversation.conversation_id = :cid
+                      AND pending.type = 'message.appended'
+                      AND json_type(pending.payload, '$.delivery') = 'object'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM conversation_events AS progress,
+                          json_each(progress.payload, '$.consumed_message_ids') AS consumed
+                        WHERE progress.conversation_ref = pending.conversation_ref
+                          AND progress.seq > pending.seq
+                          AND consumed.value = pending.event_id)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM conversation_events AS progress,
+                          json_each(progress.payload, '$.discarded_message_ids') AS discarded
+                        WHERE progress.conversation_ref = pending.conversation_ref
+                          AND progress.seq > pending.seq
+                          AND discarded.value = pending.event_id)
+                    ORDER BY pending.seq"""),
+                {"cid": cid},
+            )
+            return [
+                ConversationEvent(**{**row, "payload": json.loads(row["payload"])})
+                for row in rows.mappings()
+            ]
 
     async def events(
         self,
